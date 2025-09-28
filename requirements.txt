@@ -1,0 +1,15 @@
+tweepy
+python-dotenv
+pycoingecko
+etherscan-python
+bscscan-python
+transformers
+numpy
+scipy
+pandas
+praw
+python-telegram-bot
+web3
+keras
+tensorflow
+optuna

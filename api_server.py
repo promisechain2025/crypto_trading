@@ -7,11 +7,12 @@ Run:
     uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 Endpoints:
-    GET  /health              — server health + model status + CV stats
-    GET  /predict/both        — predictions for 5 min AND 15 min
-    GET  /predict/{5|15}      — prediction for one horizon
-    GET  /backtest/{5|15}     — backtest accuracy/coverage results
-    POST /retrain/{5|15}      — trigger manual model retraining
+    GET  /health                            — server health + model status + CV stats
+    GET  /predict/both                      — predictions for 5 min AND 15 min
+    GET  /predict/{5|15}                    — prediction for one horizon
+    GET  /backtest/{5|15}                   — backtest with optimised threshold
+    GET  /optimize-threshold/{5|15}         — find & apply optimal threshold
+    POST /retrain/{5|15}                    — retrain + re-optimise threshold
 """
 
 import asyncio
@@ -25,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from btc_predictor import BTCPredictor
 
-RETRAIN_INTERVAL_SECONDS = 3600  # auto-retrain every hour
+RETRAIN_INTERVAL_SECONDS = 3600  # auto-retrain + re-optimise every hour
 
 predictor   = BTCPredictor()
 _ready      = {5: False, 15: False}
@@ -33,7 +34,7 @@ _trained_at = {5: None,  15: None}
 
 
 def _train(h: int) -> None:
-    """Train (or retrain) a model for horizon h, updating shared state."""
+    """Train model for horizon h (includes automatic threshold optimisation)."""
     predictor.train(h)
     _ready[h]      = True
     _trained_at[h] = datetime.now(timezone.utc).isoformat()
@@ -41,7 +42,6 @@ def _train(h: int) -> None:
 
 
 def _background_retrain() -> None:
-    """Daemon thread: retrain both models every RETRAIN_INTERVAL_SECONDS."""
     while True:
         time.sleep(RETRAIN_INTERVAL_SECONDS)
         for h in [5, 15]:
@@ -53,26 +53,24 @@ def _background_retrain() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Train models on startup, then launch background retrainer."""
     loop = asyncio.get_event_loop()
-    # Train sequentially so 5min is ready first
     for h in [5, 15]:
         await loop.run_in_executor(None, _train, h)
-    t = threading.Thread(target=_background_retrain, daemon=True)
-    t.start()
+    threading.Thread(target=_background_retrain, daemon=True).start()
     yield
 
 
 app = FastAPI(
     title="BTC Price Predictor API",
     description=(
-        "Predicts BTC/USDT price direction (UP / DOWN / UNCERTAIN) "
-        "for 5-min and 15-min horizons using a LightGBM + XGBoost ensemble. "
-        "Only reports a directional call when ensemble confidence ≥ 65%; "
-        "these high-confidence predictions target ≥80% accuracy. "
+        "Predicts BTC/USDT price direction (UP / DOWN / UNCERTAIN) for 5-min and "
+        "15-min horizons using a LightGBM + XGBoost ensemble. "
+        "The confidence threshold is auto-optimised after each training run to "
+        "achieve ≥80% accuracy while maximising the fraction of candles that "
+        "receive a directional call (coverage). "
         "Data source: Binance public API — no API key required."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -84,15 +82,19 @@ app.add_middleware(
 )
 
 
-# ── Routes ──────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
-@app.get("/health", summary="Server health and model status")
+@app.get("/health", summary="Server health, model readiness and CV stats")
 async def health():
     return {
-        "status"      : "ok",
-        "models_ready": _ready,
-        "trained_at"  : _trained_at,
-        "cv_stats"    : {str(h): predictor.cv_stats.get(h) for h in [5, 15]},
+        "status"            : "ok",
+        "models_ready"      : _ready,
+        "trained_at"        : _trained_at,
+        "active_thresholds" : {
+            str(h): round(predictor.thresholds.get(h, predictor._default_threshold) * 100, 2)
+            for h in [5, 15]
+        },
+        "cv_stats": {str(h): predictor.cv_stats.get(h) for h in [5, 15]},
     }
 
 
@@ -117,7 +119,7 @@ async def predict(horizon: int):
     if horizon not in (5, 15):
         raise HTTPException(400, detail="horizon must be 5 or 15")
     if not _ready[horizon]:
-        raise HTTPException(503, detail=f"{horizon}min model is not ready yet. Retry shortly.")
+        raise HTTPException(503, detail=f"{horizon}min model is not ready yet.")
     try:
         result = predictor.predict(horizon)
         result["cv_stats"]   = predictor.cv_stats.get(horizon)
@@ -130,8 +132,10 @@ async def predict(horizon: int):
 @app.get("/backtest/{horizon}", summary="Backtest accuracy and threshold curve")
 async def backtest(
     horizon: int,
-    recent_n: int = Query(default=400, ge=50, le=1000,
-                          description="Number of recent 1-min candles to test on"),
+    recent_n: int = Query(
+        default=400, ge=50, le=1000,
+        description="Number of recent 1-min candles to evaluate on",
+    ),
 ):
     if horizon not in (5, 15):
         raise HTTPException(400, detail="horizon must be 5 or 15")
@@ -143,15 +147,53 @@ async def backtest(
         raise HTTPException(500, detail=str(e))
 
 
-@app.post("/retrain/{horizon}", summary="Trigger manual model retraining")
+@app.get(
+    "/optimize-threshold/{horizon}",
+    summary="Find the lowest threshold that hits target accuracy, maximising coverage",
+)
+async def optimize_threshold(
+    horizon: int,
+    target_accuracy: float = Query(
+        default=0.80, ge=0.50, le=0.99,
+        description="Minimum acceptable accuracy (0.80 = 80%)",
+    ),
+    recent_n: int = Query(
+        default=400, ge=50, le=1000,
+        description="Number of recent candles to calibrate on",
+    ),
+):
+    """
+    Scans confidence thresholds from 50% to 95% in 0.5% steps.
+    Picks the lowest threshold that achieves `target_accuracy` on recent hold-out
+    data — maximising the fraction of candles that get a directional prediction.
+    The selected threshold is applied immediately and persisted to disk.
+    """
+    if horizon not in (5, 15):
+        raise HTTPException(400, detail="horizon must be 5 or 15")
+    if not _ready[horizon]:
+        raise HTTPException(503, detail=f"{horizon}min model is not ready yet.")
+    try:
+        return predictor.optimize_threshold(
+            horizon,
+            target_accuracy=target_accuracy,
+            recent_n=recent_n,
+        )
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/retrain/{horizon}", summary="Retrain model and re-optimise threshold")
 async def retrain(horizon: int):
     if horizon not in (5, 15):
         raise HTTPException(400, detail="horizon must be 5 or 15")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _train, horizon)
     return {
-        "status"    : "success",
-        "horizon"   : horizon,
-        "trained_at": _trained_at[horizon],
-        "cv_stats"  : predictor.cv_stats.get(horizon),
+        "status"            : "success",
+        "horizon"           : horizon,
+        "trained_at"        : _trained_at[horizon],
+        "optimised_threshold_pct": round(
+            predictor.thresholds.get(horizon, predictor._default_threshold) * 100, 2
+        ),
+        "cv_stats": predictor.cv_stats.get(horizon),
     }
